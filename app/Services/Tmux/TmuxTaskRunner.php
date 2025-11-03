@@ -24,6 +24,27 @@ class TmuxTaskRunner
     }
 
     /**
+     * Get niceness value from settings or config with sensible default
+     */
+    protected function getNiceness(): int
+    {
+        // Try to get from settings first
+        $niceness = Settings::settingValue('niceness');
+
+        // If empty string or null, try config
+        if (empty($niceness) && $niceness !== 0 && $niceness !== '0') {
+            $niceness = config('nntmux.niceness');
+        }
+
+        // If still empty, use system default
+        if (empty($niceness) && $niceness !== 0 && $niceness !== '0') {
+            $niceness = 10; // Standard nice default
+        }
+
+        return (int) $niceness;
+    }
+
+    /**
      * Run a task in a specific pane
      */
     public function runTask(string $taskName, array $config): bool
@@ -56,7 +77,7 @@ class TmuxTaskRunner
     protected function disablePane(string $pane, string $taskName, string $reason): bool
     {
         $color = $this->getRandomColor();
-        $message = "echo \"\\033[38;5;{$color}m\\n{$taskName} has been disabled: {$reason}\"";
+        $message = "echo -e \"\033[38;5;{$color}m\n{$taskName} has been disabled: {$reason}\"";
 
         return $this->paneManager->respawnPane($pane, $message, kill: true);
     }
@@ -91,7 +112,7 @@ class TmuxTaskRunner
      */
     protected function buildSleepCommand(int $seconds): string
     {
-        $niceness = Settings::settingValue('niceness') ?? 2;
+        $niceness = $this->getNiceness();
         $sleepScript = base_path('app/Services/Tmux/Scripts/showsleep.php');
 
         if (file_exists($sleepScript)) {
@@ -164,7 +185,7 @@ class TmuxTaskRunner
             return $this->disablePane($pane, 'IRC Scraper', 'disabled in settings');
         }
 
-        $niceness = Settings::settingValue('niceness') ?? 2;
+        $niceness = $this->getNiceness();
         $artisan = base_path('artisan');
         $command = "nice -n{$niceness} php {$artisan} irc:scrape";
         $command = $this->buildCommand($command, ['log_pane' => 'scraper']);
@@ -198,7 +219,7 @@ class TmuxTaskRunner
             return false;
         }
 
-        $niceness = Settings::settingValue('niceness') ?? 2;
+        $niceness = $this->getNiceness();
         $command = "nice -n{$niceness} ".PHP_BINARY." artisan {$artisanCommand}";
         $sleep = (int) ($config['settings']['bins_timer'] ?? 60);
         $command = $this->buildCommand($command, ['log_pane' => 'binaries', 'sleep' => $sleep]);
@@ -243,7 +264,7 @@ class TmuxTaskRunner
             ? floor($collections / 500)
             : $baseSleep;
 
-        $niceness = Settings::settingValue('niceness') ?? 2;
+        $niceness = $this->getNiceness();
         $command = "nice -n{$niceness} ".PHP_BINARY." artisan {$artisanCommand}";
         $command = $this->buildCommand($command, ['log_pane' => 'backfill', 'sleep' => $sleep]);
 
@@ -262,7 +283,7 @@ class TmuxTaskRunner
             return $this->disablePane($pane, 'Update Releases', 'disabled in settings');
         }
 
-        $niceness = Settings::settingValue('niceness') ?? 2;
+        $niceness = $this->getNiceness();
         $command = "nice -n{$niceness} ".PHP_BINARY.' artisan multiprocessing:releases';
         $sleep = (int) ($config['settings']['rel_timer'] ?? 60);
         $command = $this->buildCommand($command, ['log_pane' => 'releases', 'sleep' => $sleep]);
@@ -337,7 +358,7 @@ class TmuxTaskRunner
         // Full sequential mode - runs group:update-all for each group
         $pane = '0.1';
 
-        $niceness = Settings::settingValue('niceness') ?? 2;
+        $niceness = $this->getNiceness();
         $artisan = base_path('artisan');
         $command = "nice -n{$niceness} php {$artisan} group:update-all";
         $command = $this->buildCommand($command, ['log_pane' => 'sequential']);
@@ -373,7 +394,8 @@ class TmuxTaskRunner
 
         $sleep = (int) ($runVar['settings']['fix_timer'] ?? 300);
         $allCommands = implode('; ', $commands);
-        $fullCommand = "{$allCommands}; date +'%Y-%m-%d %T'; sleep {$sleep}";
+        $sleepCommand = $this->buildSleepCommand($sleep);
+        $fullCommand = "{$allCommands}; date +'%Y-%m-%d %T'; {$sleepCommand}";
 
         return $this->paneManager->respawnPane($pane, $fullCommand);
     }
@@ -391,7 +413,7 @@ class TmuxTaskRunner
             return $this->disablePane($pane, 'Remove Crap', 'disabled in settings');
         }
 
-        $niceness = Settings::settingValue('niceness') ?? 2;
+        $niceness = $this->getNiceness();
         $artisan = base_path('artisan');
         $sleep = (int) ($runVar['settings']['crap_timer'] ?? 300);
 
@@ -437,12 +459,13 @@ class TmuxTaskRunner
             $log = $this->getLogFile('removecrap');
             $commands = [];
             foreach ($types as $type) {
-                $commands[] = "echo \"\\nRunning removeCrapReleases for {$type}\"; nice -n{$niceness} php {$artisan} releases:remove-crap --type={$type} --time={$time} --delete 2>&1 | tee -a {$log}";
+                $commands[] = "echo \"\nRunning removeCrapReleases for {$type}\"; nice -n{$niceness} php {$artisan} releases:remove-crap --type={$type} --time={$time} --delete 2>&1 | tee -a {$log}";
             }
 
             // Join all commands with semicolons and add final timestamp and sleep
             $allCommands = implode('; ', $commands);
-            $fullCommand = "{$allCommands}; date +'%Y-%m-%d %T'; sleep {$sleep}";
+            $sleepCommand = $this->buildSleepCommand($sleep);
+            $fullCommand = "{$allCommands}; date +'%Y-%m-%d %T'; {$sleepCommand}";
 
             // Mark that we're not on the first run anymore for next cycle
             $this->saveCrapState($stateFile, [
@@ -490,19 +513,62 @@ class TmuxTaskRunner
      */
     protected function runPostProcessAdditional(array $runVar): bool
     {
-        $enabled = (int) ($runVar['settings']['post'] ?? 0);
+        $postSetting = (int) ($runVar['settings']['post'] ?? 0);
         $pane = '2.0';
 
-        if ($enabled !== 1) {
+        // Check if post processing is enabled (1 = additional, 2 = nfo, 3 = both)
+        if ($postSetting === 0) {
             return $this->disablePane($pane, 'Post-process Additional', 'disabled in settings');
         }
 
-        $niceness = Settings::settingValue('niceness') ?? 2;
-        $command = "nice -n{$niceness} ".PHP_BINARY.' artisan update:postprocess additional true';
-        $sleep = (int) ($runVar['settings']['post_timer'] ?? 300);
-        $command = $this->buildCommand($command, ['log_pane' => 'post_additional', 'sleep' => $sleep]);
+        $hasWork = (int) ($runVar['counts']['now']['work'] ?? 0) > 0;
+        $hasNfo = (int) ($runVar['counts']['now']['processnfo'] ?? 0) > 0;
 
-        return $this->paneManager->respawnPane($pane, $command);
+        $niceness = Settings::settingValue('niceness') ?? 2;
+        $log = $this->getLogFile('post_additional');
+        $sleep = (int) ($runVar['settings']['post_timer'] ?? 300);
+
+        $commands = [];
+
+        // Build commands based on post setting value
+        if ($postSetting === 1) {
+            // Post = 1: Additional processing only
+            if ($hasWork) {
+                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan update:postprocess additional true 2>&1 | tee -a {$log}";
+            }
+        } elseif ($postSetting === 2) {
+            // Post = 2: NFO processing only
+            if ($hasNfo) {
+                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan update:postprocess nfo true 2>&1 | tee -a {$log}";
+            }
+        } elseif ($postSetting === 3) {
+            // Post = 3: Both additional and NFO
+            if ($hasWork) {
+                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan update:postprocess additional true 2>&1 | tee -a {$log}";
+            }
+            if ($hasNfo) {
+                $commands[] = "nice -n{$niceness} ".PHP_BINARY." artisan update:postprocess nfo true 2>&1 | tee -a {$log}";
+            }
+        }
+
+        // If no work available, disable the pane
+        if (empty($commands)) {
+            $reason = match ($postSetting) {
+                1 => 'no additional work to process',
+                2 => 'no NFOs to process',
+                3 => 'no additional work or NFOs to process',
+                default => 'invalid post setting value',
+            };
+
+            return $this->disablePane($pane, 'Post-process Additional', $reason);
+        }
+
+        // Build the full command with all parts
+        $allCommands = implode('; ', $commands);
+        $sleepCommand = $this->buildSleepCommand($sleep);
+        $fullCommand = "{$allCommands}; date +'%Y-%m-%d %T'; {$sleepCommand}";
+
+        return $this->paneManager->respawnPane($pane, $fullCommand);
     }
 
     /**
@@ -517,27 +583,58 @@ class TmuxTaskRunner
             return $this->disablePane($pane, 'Post-process Non-Amazon', 'disabled in settings');
         }
 
-        $hasWork = (int) ($runVar['counts']['now']['processmovies'] ?? 0) > 0
-            || (int) ($runVar['counts']['now']['processtv'] ?? 0) > 0
-            || (int) ($runVar['counts']['now']['processanime'] ?? 0) > 0;
+        $niceness = $this->getNiceness();
+        $log = $this->getLogFile('post_non');
+        $artisan = PHP_BINARY.' artisan';
+        $commands = [];
 
-        if (! $hasWork) {
-            return $this->disablePane($pane, 'Post-process Non-Amazon', 'no movies/tv/anime to process');
+        // Only add TV processing if enabled and has work
+        $processTv = (int) ($runVar['settings']['processtvrage'] ?? 0);
+        $hasTvWork = (int) ($runVar['counts']['now']['processtv'] ?? 0) > 0;
+        if ($processTv > 0 && $hasTvWork) {
+            $commands[] = "nice -n{$niceness} {$artisan} update:postprocess tv true 2>&1 | tee -a {$log}";
         }
 
-        $niceness = Settings::settingValue('niceness') ?? 2;
-        $log = $this->getLogFile('post_non');
+        // Only add Movies processing if enabled and has work
+        $processMovies = (int) ($runVar['settings']['processmovies'] ?? 0);
+        $hasMoviesWork = (int) ($runVar['counts']['now']['processmovies'] ?? 0) > 0;
+        if ($processMovies > 0 && $hasMoviesWork) {
+            $commands[] = "nice -n{$niceness} {$artisan} update:postprocess movies true 2>&1 | tee -a {$log}";
+        }
 
-        $artisan = PHP_BINARY.' artisan';
-        $commands = [
-            "{$artisan} update:postprocess tv true 2>&1 | tee -a {$log}",
-            "{$artisan} update:postprocess movies true 2>&1 | tee -a {$log}",
-            "{$artisan} update:postprocess anime true 2>&1 | tee -a {$log}",
-        ];
+        // Only add Anime processing if enabled and has work
+        $processAnime = (int) ($runVar['settings']['processanime'] ?? 0);
+        $hasAnimeWork = (int) ($runVar['counts']['now']['processanime'] ?? 0) > 0;
+        if ($processAnime > 0 && $hasAnimeWork) {
+            $commands[] = "nice -n{$niceness} {$artisan} update:postprocess anime true 2>&1 | tee -a {$log}";
+        }
+
+        // If no work available for any enabled type, disable the pane
+        if (empty($commands)) {
+            $enabledTypes = [];
+            if ($processTv > 0) {
+                $enabledTypes[] = 'TV';
+            }
+            if ($processMovies > 0) {
+                $enabledTypes[] = 'Movies';
+            }
+            if ($processAnime > 0) {
+                $enabledTypes[] = 'Anime';
+            }
+
+            if (empty($enabledTypes)) {
+                return $this->disablePane($pane, 'Post-process Non-Amazon', 'no types enabled (TV/Movies/Anime)');
+            }
+
+            $typesList = implode(', ', $enabledTypes);
+
+            return $this->disablePane($pane, 'Post-process Non-Amazon', "no work for enabled types ({$typesList})");
+        }
 
         $sleep = (int) ($runVar['settings']['post_timer_non'] ?? 300);
-        $allCommands = "nice -n{$niceness} ".implode('; nice -n{$niceness} ', $commands);
-        $fullCommand = "{$allCommands}; date +'%Y-%m-%d %T'; sleep {$sleep}";
+        $allCommands = implode('; ', $commands);
+        $sleepCommand = $this->buildSleepCommand($sleep);
+        $fullCommand = "{$allCommands}; date +'%Y-%m-%d %T'; {$sleepCommand}";
 
         return $this->paneManager->respawnPane($pane, $fullCommand);
     }
