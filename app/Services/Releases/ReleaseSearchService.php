@@ -57,51 +57,44 @@ class ReleaseSearchService
         array $cat = [-1],
         int $minSize = 0
     ): mixed {
-        if (config('app.debug')) {
-            Log::debug('ReleaseSearchService::search called', [
-                'searchArr' => $searchArr,
-                'limit' => $limit,
-            ]);
-        }
-
-        // Get search results from index
+        // Get search results from index (Elasticsearch/Manticore/MySQL fallback)
         $searchResult = $this->performIndexSearch($searchArr, $limit);
 
-        if (config('app.debug')) {
-            Log::debug('ReleaseSearchService::search after performIndexSearch', [
-                'result_count' => count($searchResult),
-            ]);
-        }
-
-        if (count($searchResult) === 0) {
+        if (empty($searchResult)) {
             return collect();
         }
 
-        // Build WHERE clause
-        $whereSql = $this->buildSearchWhereClause(
-            $searchResult,
-            $groupName,
-            $sizeFrom,
-            $sizeTo,
-            $daysNew,
-            $daysOld,
-            $maxAge,
-            $excludedCats,
-            $type,
-            $cat,
-            $minSize
+        // Build conditions array for efficient WHERE clause
+        $conditions = $this->buildSearchConditions(
+            $searchResult, $groupName, $sizeFrom, $sizeTo, $daysNew, $daysOld,
+            $maxAge, $excludedCats, $type, $cat, $minSize
         );
 
-        // Build base SQL
-        $baseSql = $this->buildSearchBaseSql($whereSql);
-
-        // Get order by clause
+        $whereSql = 'WHERE ' . implode(' AND ', $conditions);
         $orderBy = $this->getBrowseOrder($orderBy === '' ? 'posted_desc' : $orderBy);
 
-        // Build final SQL with pagination
+        // Optimized query: direct query without subquery wrapper, filter on releases first using indexed columns
         $sql = sprintf(
-            'SELECT * FROM (%s) r ORDER BY r.%s %s LIMIT %d OFFSET %d',
-            $baseSql,
+            "SELECT r.id, r.searchname, r.guid, r.postdate, r.groups_id, r.categories_id,
+                    r.size, r.totalpart, r.fromname, r.passwordstatus, r.grabs, r.comments,
+                    r.adddate, r.videos_id, r.tv_episodes_id, r.haspreview, r.jpgstatus,
+                    cp.title AS parent_category, c.title AS sub_category,
+                    CONCAT(cp.title, ' > ', c.title) AS category_name,
+                    g.name AS group_name, cp.id AS categoryparentid,
+                    v.tvdb, v.trakt, v.tvrage, v.tvmaze, v.imdb, v.tmdb,
+                    tve.firstaired,
+                    rn.releases_id AS nfoid
+            FROM releases r
+            INNER JOIN categories c ON c.id = r.categories_id
+            INNER JOIN root_categories cp ON cp.id = c.root_categories_id
+            LEFT JOIN usenet_groups g ON g.id = r.groups_id
+            LEFT JOIN videos v ON r.videos_id = v.id AND r.videos_id > 0
+            LEFT JOIN tv_episodes tve ON r.tv_episodes_id = tve.id AND r.tv_episodes_id > 0
+            LEFT JOIN release_nfos rn ON rn.releases_id = r.id
+            %s
+            ORDER BY r.%s %s
+            LIMIT %d OFFSET %d",
+            $whereSql,
             $orderBy[0],
             $orderBy[1],
             $limit,
@@ -109,25 +102,126 @@ class ReleaseSearchService
         );
 
         // Check cache
-        $cacheKey = md5($this->getCacheVersion().$sql);
+        $cacheKey = md5($this->getCacheVersion() . $sql);
         $releases = Cache::get($cacheKey);
         if ($releases !== null) {
             return $releases;
         }
 
-        // Execute query
         $releases = Release::fromQuery($sql);
 
-        // Add total count for pagination
+        // Optimized count query - only uses releases table with indexed conditions
         if ($releases->isNotEmpty()) {
-            $releases[0]->_totalrows = $this->getPagerCount($baseSql);
+            $releases[0]->_totalrows = $this->getOptimizedCount($conditions);
         }
 
-        // Cache results
-        $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_medium'));
-        Cache::put($cacheKey, $releases, $expiresAt);
+        Cache::put($cacheKey, $releases, now()->addMinutes(config('nntmux.cache_expiry_medium')));
 
         return $releases;
+    }
+
+    /**
+     * Build search conditions array for WHERE clause.
+     * Consolidates all condition building into a single method.
+     */
+    private function buildSearchConditions(
+        array $searchResult,
+        $groupName,
+        $sizeFrom,
+        $sizeTo,
+        $daysNew,
+        $daysOld,
+        int $maxAge,
+        array $excludedCats,
+        string $type,
+        array $cat,
+        int $minSize
+    ): array {
+        // Size range multipliers (100MB base)
+        $sizeRange = [1 => 1, 2 => 2.5, 3 => 5, 4 => 10, 5 => 20, 6 => 30, 7 => 40, 8 => 80, 9 => 160, 10 => 320, 11 => 640];
+        $sizeBase = 104857600; // 100MB in bytes
+
+        $conditions = [
+            sprintf('r.passwordstatus %s', $this->showPasswords()),
+            sprintf('r.id IN (%s)', implode(',', array_map('intval', $searchResult))),
+        ];
+
+        if ($maxAge > 0) {
+            $conditions[] = sprintf('r.postdate > (NOW() - INTERVAL %d DAY)', $maxAge);
+        }
+
+        if ((int) $groupName !== -1 && ($groupId = UsenetGroup::getIDByName($groupName))) {
+            $conditions[] = sprintf('r.groups_id = %d', $groupId);
+        }
+
+        // Size range conditions - uses indexed size column
+        if (isset($sizeRange[$sizeFrom])) {
+            $conditions[] = sprintf('r.size > %d', (int)($sizeBase * $sizeRange[$sizeFrom]));
+        }
+        if (isset($sizeRange[$sizeTo])) {
+            $conditions[] = sprintf('r.size < %d', (int)($sizeBase * $sizeRange[$sizeTo]));
+        }
+        if ($minSize > 0) {
+            $conditions[] = sprintf('r.size >= %d', $minSize);
+        }
+
+        // Category conditions - uses indexed categories_id column
+        if ($type === 'basic') {
+            $catQuery = preg_replace('/^(WHERE|AND)\s+/i', '', trim(Category::getCategorySearch($cat)));
+            if (!empty($catQuery) && $catQuery !== '1=1') {
+                $conditions[] = $catQuery;
+            }
+        } elseif ($type === 'advanced' && (int) $cat[0] !== -1) {
+            $conditions[] = sprintf('r.categories_id = %d', (int) $cat[0]);
+        }
+
+        // Date range conditions - uses indexed postdate column
+        if ((int) $daysNew !== -1) {
+            $conditions[] = sprintf('r.postdate < (NOW() - INTERVAL %d DAY)', (int) $daysNew);
+        }
+        if ((int) $daysOld !== -1) {
+            $conditions[] = sprintf('r.postdate > (NOW() - INTERVAL %d DAY)', (int) $daysOld);
+        }
+
+        // Excluded categories
+        if (!empty($excludedCats)) {
+            $conditions[] = sprintf('r.categories_id NOT IN (%s)', implode(',', array_map('intval', $excludedCats)));
+        }
+
+        return $conditions;
+    }
+
+    /**
+     * Get optimized count using releases table only with indexed columns.
+     * Avoids expensive JOINs for count operations.
+     */
+    private function getOptimizedCount(array $conditions): int
+    {
+        $maxResults = (int) config('nntmux.max_pager_results');
+        $whereSql = 'WHERE ' . implode(' AND ', $conditions);
+        $cacheKey = 'count_' . md5($whereSql);
+
+        $count = Cache::get($cacheKey);
+        if ($count !== null) {
+            return (int) $count;
+        }
+
+        try {
+            // Simple count on releases table - uses indexes efficiently
+            $countSql = sprintf('SELECT COUNT(*) as count FROM releases r %s', $whereSql);
+            $result = DB::selectOne($countSql);
+            $count = $result->count ?? 0;
+
+            if ($maxResults > 0 && $count > $maxResults) {
+                $count = $maxResults;
+            }
+
+            Cache::put($cacheKey, $count, now()->addMinutes(config('nntmux.cache_expiry_short')));
+            return (int) $count;
+        } catch (\Throwable $e) {
+            Log::error('getOptimizedCount failed', ['error' => $e->getMessage()]);
+            return 0;
+        }
     }
 
     /**
