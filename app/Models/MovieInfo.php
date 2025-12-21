@@ -77,22 +77,21 @@ class MovieInfo extends Model
     public static function getAll(string $search = ''): mixed
     {
         $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_medium'));
-        $cacheKey = 'movieinfo_all_'.md5($search);
-        $movie = Cache::get($cacheKey);
+        $movie = Cache::get(md5($search));
         if ($movie !== null) {
             return $movie;
         }
-        $sql = self::query()->select(['id', 'imdbid', 'tmdbid', 'title', 'year', 'rating', 'cover', 'genre']);
+        $sql = self::query()->select('*');
         if (! empty($search)) {
             // Search by both title and IMDB ID
             $sql->where(function ($query) use ($search) {
-                $query->where('title', 'LIKE', '%'.$search.'%')
+                $query->whereLike('title', '%'.$search.'%')
                     ->orWhere('imdbid', $search);
             });
         }
 
         $movie = $sql->paginate(config('nntmux.items_per_page'));
-        Cache::put($cacheKey, $movie, $expiresAt);
+        Cache::put(md5($search), $movie, $expiresAt);
 
         return $movie;
     }
