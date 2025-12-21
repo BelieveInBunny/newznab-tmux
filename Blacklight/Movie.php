@@ -15,7 +15,6 @@ use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Support\Arr;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -146,7 +145,7 @@ class Movie
 
     /**
      * Get movie releases with covers for movie browse page.
-     *
+     * Optimized for performance with millions of rows.
      *
      * @return array|mixed
      */
@@ -154,78 +153,163 @@ class Movie
     {
         $page = max(1, $page);
         $start = max(0, $start);
-        $catsrch = '';
-        if (count($cat) > 0 && $cat[0] !== -1) {
-            $catsrch = Category::getCategorySearch($cat);
-        }
         $order = $this->getMovieOrder($orderBy);
         $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_medium'));
-        $whereAge = $maxAge > 0 ? 'AND r.postdate > NOW() - INTERVAL '.$maxAge.' DAY ' : '';
-        $whereExcluded = count($excludedCats) > 0 ? ' AND r.categories_id NOT IN ('.implode(',', $excludedCats).')' : '';
-        $limitClause = $start === false ? '' : ' LIMIT '.$num.' OFFSET '.$start;
-        $moviesSql = "SELECT SQL_CALC_FOUND_ROWS m.imdbid, GROUP_CONCAT(r.id ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_id "
-            ."FROM movieinfo m LEFT JOIN releases r USING (imdbid) WHERE m.title != '' AND m.imdbid != '0000000' "
-            ."AND r.passwordstatus {$this->showPasswords} "
-            .$this->getBrowseBy().' '
-            .(! empty($catsrch) ? $catsrch.' ' : '')
-            .$whereAge
-            .$whereExcluded.' '
-            ."GROUP BY m.imdbid ORDER BY {$order[0]} {$order[1]} {$limitClause}";
-        $movieCache = Cache::get(md5($moviesSql.$page));
-        if ($movieCache !== null) {
-            $movies = $movieCache;
-        } else {
-            $data = MovieInfo::fromQuery($moviesSql);
-            $movies = ['total' => DB::select('SELECT FOUND_ROWS() AS total'), 'result' => $data];
-            Cache::put(md5($moviesSql.$page), $movies, $expiresAt);
+
+        // Build cache key from parameters
+        $cacheKey = 'movie_range_'.md5(json_encode([
+            $page, $cat, $start, $num, $orderBy, $maxAge, $excludedCats, $this->showPasswords,
+            request()->only(['title', 'director', 'actors', 'genre', 'rating', 'year', 'imdb']),
+        ]));
+
+        $cachedResult = Cache::get($cacheKey);
+        if ($cachedResult !== null) {
+            return $cachedResult;
         }
-        $movieIDs = $releaseIDs = [];
-        if (! empty($movies['result'])) {
-            foreach ($movies['result'] as $id) {
-                $movieIDs[] = $id->imdbid;
-                $releaseIDs[] = $id->grp_release_id;
+
+        // Build base query for movies with releases
+        $movieQuery = MovieInfo::query()
+            ->select('movieinfo.imdbid')
+            ->join('releases as r', 'r.imdbid', '=', 'movieinfo.imdbid')
+            ->where('movieinfo.title', '!=', '')
+            ->where('movieinfo.imdbid', '!=', '0000000')
+            ->whereRaw("r.passwordstatus {$this->showPasswords}");
+
+        // Apply category filter
+        if (count($cat) > 0 && $cat[0] !== -1) {
+            $catsrch = Category::getCategorySearch($cat);
+            if (! empty($catsrch) && $catsrch !== 'AND 1=1') {
+                // Remove leading AND and apply as whereRaw
+                $cleanCatSearch = preg_replace('/^\s*AND\s+/i', '', $catsrch);
+                $movieQuery->whereRaw($cleanCatSearch);
             }
         }
-        $inMovieIds = (is_array($movieIDs) && ! empty($movieIDs)) ? implode(',', $movieIDs) : -1;
-        $inReleaseIds = (is_array($releaseIDs) && ! empty($releaseIDs)) ? implode(',', $releaseIDs) : -1;
-        $sql = 'SELECT '
-            ."GROUP_CONCAT(r.id ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_id, "
-            ."GROUP_CONCAT(r.rarinnerfilecount ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_rarinnerfilecount, "
-            ."GROUP_CONCAT(r.haspreview ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_haspreview, "
-            ."GROUP_CONCAT(r.passwordstatus ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_password, "
-            ."GROUP_CONCAT(r.guid ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_guid, "
-            ."GROUP_CONCAT(rn.releases_id ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_nfoid, "
-            ."GROUP_CONCAT(g.name ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_grpname, "
-            ."GROUP_CONCAT(r.searchname ORDER BY r.postdate DESC SEPARATOR '#') AS grp_release_name, "
-            ."GROUP_CONCAT(r.postdate ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_postdate, "
-            ."GROUP_CONCAT(r.adddate ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_adddate, "
-            ."GROUP_CONCAT(r.size ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_size, "
-            ."GROUP_CONCAT(r.totalpart ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_totalparts, "
-            ."GROUP_CONCAT(r.comments ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_comments, "
-            ."GROUP_CONCAT(r.grabs ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_grabs, "
-            ."GROUP_CONCAT(df.failed ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_failed, "
-            ."GROUP_CONCAT(cp.title, ' > ', c.title ORDER BY r.postdate DESC SEPARATOR ',' ) AS grp_release_catname, "
-            .'m.*, g.name AS group_name, rn.releases_id AS nfoid FROM releases r '
-            .'LEFT OUTER JOIN usenet_groups g ON g.id = r.groups_id '
-            .'LEFT OUTER JOIN release_nfos rn ON rn.releases_id = r.id '
-            .'LEFT OUTER JOIN dnzb_failures df ON df.release_id = r.id '
-            .'LEFT OUTER JOIN categories c ON c.id = r.categories_id '
-            .'LEFT OUTER JOIN root_categories cp ON cp.id = c.root_categories_id '
-            .'INNER JOIN movieinfo m ON m.imdbid = r.imdbid '
-            ."WHERE m.imdbid IN ($inMovieIds) AND r.id IN ($inReleaseIds) "
-            .(! empty($catsrch) ? $catsrch.' ' : '')
-            ."GROUP BY m.imdbid ORDER BY {$order[0]} {$order[1]}";
-        $return = Cache::get(md5($sql.$page));
-        if ($return !== null) {
-            return $return;
+
+        // Apply age filter using index-friendly comparison
+        if ($maxAge > 0) {
+            $movieQuery->where('r.postdate', '>', now()->subDays($maxAge));
         }
-        $return = Release::fromQuery($sql);
-        if (count($return) > 0) {
-            $return[0]->_totalcount = $movies['total'][0]->total ?? 0;
+
+        // Apply excluded categories filter
+        if (count($excludedCats) > 0) {
+            $movieQuery->whereNotIn('r.categories_id', $excludedCats);
         }
-        Cache::put(md5($sql.$page), $return, $expiresAt);
+
+        // Apply browse filters
+        $this->applyBrowseFilters($movieQuery);
+
+        // Get total count efficiently (separate count query is faster than SQL_CALC_FOUND_ROWS)
+        $countQuery = (clone $movieQuery);
+        $totalCount = $countQuery->distinct('movieinfo.imdbid')->count('movieinfo.imdbid');
+
+        // Apply ordering with GROUP BY
+        $orderField = $order[0];
+        $orderDir = $order[1];
+
+        $movieQuery->groupBy('movieinfo.imdbid');
+
+        if ($orderField === 'MAX(r.postdate)') {
+            $movieQuery->orderByRaw("MAX(r.postdate) {$orderDir}");
+        } else {
+            $movieQuery->orderByRaw("{$orderField} {$orderDir}");
+        }
+
+        // Apply pagination
+        if ($start !== false) {
+            $movieQuery->offset($start)->limit($num);
+        }
+
+        $movieIds = $movieQuery->pluck('movieinfo.imdbid')->toArray();
+
+        if (empty($movieIds)) {
+            return collect();
+        }
+
+        // Get latest release per movie using a more efficient subquery approach
+        $quotedIds = array_map(fn ($id) => "'".$id."'", $movieIds);
+        $inClause = implode(',', $quotedIds);
+
+        // Use lateral join pattern for MySQL 8.0+ or correlated subquery for older versions
+        $latestReleaseIds = DB::table('releases as r')
+            ->select('r.id')
+            ->whereIn('r.imdbid', $movieIds)
+            ->whereRaw("r.passwordstatus {$this->showPasswords}")
+            ->whereRaw("r.id = (
+                SELECT r2.id FROM releases r2
+                WHERE r2.imdbid = r.imdbid
+                AND r2.passwordstatus {$this->showPasswords}
+                ORDER BY r2.postdate DESC
+                LIMIT 1
+            )")
+            ->pluck('id')
+            ->toArray();
+
+        if (empty($latestReleaseIds)) {
+            return collect();
+        }
+
+        // Fetch complete movie and release data in one query
+        $return = Release::query()
+            ->select([
+                'r.id as grp_release_id',
+                'r.rarinnerfilecount as grp_rarinnerfilecount',
+                'r.haspreview as grp_haspreview',
+                'r.passwordstatus as grp_release_password',
+                'r.guid as grp_release_guid',
+                'rn.releases_id as grp_release_nfoid',
+                'g.name as grp_release_grpname',
+                'r.searchname as grp_release_name',
+                'r.postdate as grp_release_postdate',
+                'r.adddate as grp_release_adddate',
+                'r.size as grp_release_size',
+                'r.totalpart as grp_release_totalparts',
+                'r.comments as grp_release_comments',
+                'r.grabs as grp_release_grabs',
+                'df.failed as grp_release_failed',
+                DB::raw("CONCAT(COALESCE(cp.title, ''), ' > ', COALESCE(c.title, '')) as grp_release_catname"),
+                'm.*',
+                'g.name as group_name',
+                'rn.releases_id as nfoid',
+            ])
+            ->from('releases as r')
+            ->leftJoin('usenet_groups as g', 'g.id', '=', 'r.groups_id')
+            ->leftJoin('release_nfos as rn', 'rn.releases_id', '=', 'r.id')
+            ->leftJoin('dnzb_failures as df', 'df.release_id', '=', 'r.id')
+            ->leftJoin('categories as c', 'c.id', '=', 'r.categories_id')
+            ->leftJoin('root_categories as cp', 'cp.id', '=', 'c.root_categories_id')
+            ->join('movieinfo as m', 'm.imdbid', '=', 'r.imdbid')
+            ->whereIn('r.id', $latestReleaseIds)
+            ->orderByRaw("FIELD(m.imdbid, {$inClause})")
+            ->get();
+
+        if ($return->isNotEmpty()) {
+            $return[0]->_totalcount = $totalCount;
+        }
+
+        Cache::put($cacheKey, $return, $expiresAt);
 
         return $return;
+    }
+
+    /**
+     * Apply browse-by filters to the query using Eloquent.
+     */
+    protected function applyBrowseFilters(Builder $query): void
+    {
+        $browseByArr = ['title', 'director', 'actors', 'genre', 'rating', 'year', 'imdb'];
+        foreach ($browseByArr as $bb) {
+            if (request()->has($bb) && ! empty(request()->input($bb))) {
+                $bbv = stripslashes(request()->input($bb));
+                if ($bb === 'rating') {
+                    $bbv .= '.';
+                }
+                if ($bb === 'imdb') {
+                    $query->where('movieinfo.imdbid', '=', $bbv);
+                } else {
+                    $query->where('movieinfo.'.$bb, 'LIKE', '%'.$bbv.'%');
+                }
+            }
+        }
     }
 
     /**
@@ -235,9 +319,9 @@ class Movie
     {
         $orderArr = explode('_', (($orderBy === '') ? 'MAX(r.postdate)' : $orderBy));
         $orderField = match ($orderArr[0]) {
-            'title' => 'm.title',
-            'year' => 'm.year',
-            'rating' => 'm.rating',
+            'title' => 'movieinfo.title',
+            'year' => 'movieinfo.year',
+            'rating' => 'movieinfo.rating',
             default => 'MAX(r.postdate)',
         };
 
@@ -252,26 +336,6 @@ class Movie
         return ['title_asc', 'title_desc', 'year_asc', 'year_desc', 'rating_asc', 'rating_desc'];
     }
 
-    protected function getBrowseBy(): string
-    {
-        $browseBy = ' ';
-        $browseByArr = ['title', 'director', 'actors', 'genre', 'rating', 'year', 'imdb'];
-        foreach ($browseByArr as $bb) {
-            if (request()->has($bb) && ! empty(request()->input($bb))) {
-                $bbv = stripslashes(request()->input($bb));
-                if ($bb === 'rating') {
-                    $bbv .= '.';
-                }
-                if ($bb === 'imdb') {
-                    $browseBy .= sprintf(' AND m.imdbid = %d', $bbv);
-                } else {
-                    $browseBy .= ' AND m.'.$bb.' '.'LIKE '.escapeString('%'.$bbv.'%');
-                }
-            }
-        }
-
-        return $browseBy;
-    }
 
     /**
      * Get trailer using IMDB Id.
@@ -283,26 +347,37 @@ class Movie
      */
     public function getTrailer(int $imdbId)
     {
-        $trailer = MovieInfo::query()->where('imdbid', $imdbId)->where('trailer', '<>', '')->first(['trailer']);
-        if ($trailer !== null) {
-            return $trailer['trailer'];
-        }
+        $cacheKey = 'movie_trailer_'.$imdbId;
 
-        if ($this->traktcheck !== null) {
-            $data = $this->traktTv->client->getMovieSummary('tt'.$imdbId, 'full');
-            if (($data !== false) && ! empty($data['trailer'])) {
-                return $data['trailer'];
+        return Cache::remember($cacheKey, now()->addDays(7), function () use ($imdbId) {
+            // Use value() for single column retrieval - more efficient
+            $trailer = MovieInfo::query()
+                ->where('imdbid', $imdbId)
+                ->where('trailer', '<>', '')
+                ->value('trailer');
+
+            if ($trailer !== null) {
+                return $trailer;
             }
-        }
 
-        $trailer = imdb_trailers($imdbId);
-        if ($trailer) {
-            MovieInfo::query()->where('imdbid', $imdbId)->update(['trailer' => $trailer]);
+            if ($this->traktcheck !== null) {
+                $data = $this->traktTv->client->getMovieSummary('tt'.$imdbId, 'full');
+                if (($data !== false) && ! empty($data['trailer'])) {
+                    MovieInfo::query()->where('imdbid', $imdbId)->update(['trailer' => $data['trailer']]);
 
-            return $trailer;
-        }
+                    return $data['trailer'];
+                }
+            }
 
-        return false;
+            $trailer = imdb_trailers($imdbId);
+            if ($trailer) {
+                MovieInfo::query()->where('imdbid', $imdbId)->update(['trailer' => $trailer]);
+
+                return $trailer;
+            }
+
+            return false;
+        });
     }
 
     /**
@@ -1117,13 +1192,13 @@ class Movie
                     $this->colorCli->info($this->service.' found IMDBid: tt'.$imdbId);
                 }
 
-                // Get movie info ID
-                $movieInfoId = MovieInfo::query()->where('imdbid', $imdbId)->first(['id']);
+                // Get movie info ID efficiently using value()
+                $movieInfoId = MovieInfo::query()->where('imdbid', $imdbId)->value('id');
 
                 // Update release with IMDB ID
                 Release::query()->where('id', $id)->update([
                     'imdbid' => $imdbId,
-                    'movieinfo_id' => $movieInfoId !== null ? $movieInfoId['id'] : null,
+                    'movieinfo_id' => $movieInfoId,
                 ]);
 
                 // If set, scan for IMDB info
@@ -1142,13 +1217,15 @@ class Movie
                             // Update failed, mark with invalid IMDB ID
                             Release::query()->where('id', $id)->update(['imdbid' => '0000000']);
                         } elseif ($info === true) {
-                            // Get fresh movie info ID after update
-                            $freshMovieInfo = MovieInfo::query()->where('imdbid', $imdbId)->first(['id']);
+                            // Get fresh movie info ID after update using value()
+                            $freshMovieInfoId = MovieInfo::query()->where('imdbid', $imdbId)->value('id');
 
                             // Update release with movie info ID
-                            Release::query()->where('id', $id)->update([
-                                'movieinfo_id' => $freshMovieInfo !== null ? $freshMovieInfo['id'] : null,
-                            ]);
+                            if ($freshMovieInfoId !== null) {
+                                Release::query()->where('id', $id)->update([
+                                    'movieinfo_id' => $freshMovieInfoId,
+                                ]);
+                            }
                         }
                     }
                 }
@@ -1189,12 +1266,16 @@ class Movie
             return;
         }
 
-        // Always query fresh data to avoid processing already-processed releases
         // Build query to get releases without IMDB IDs
+        // Using separate conditions instead of whereBetween for better index usage
         $query = Release::query()
             ->select(['searchname', 'id'])
-            ->whereBetween('categories_id', [Category::MOVIE_ROOT, Category::MOVIE_OTHER])
-            ->whereNull('imdbid');
+            ->where('categories_id', '>=', Category::MOVIE_ROOT)
+            ->where('categories_id', '<=', Category::MOVIE_OTHER)
+            ->where(function ($q) {
+                $q->whereNull('imdbid')
+                    ->orWhere('imdbid', '');
+            });
 
         // Apply filters if provided
         if ($groupID !== '') {
@@ -1486,6 +1567,7 @@ class Movie
 
     /**
      * Search for a movie in the local database by title and year.
+     * Optimized for large datasets by limiting results and using efficient queries.
      *
      * @return string|false IMDB ID without 'tt' prefix if found, false otherwise
      */
@@ -1504,12 +1586,13 @@ class Movie
             return Cache::get($cacheKey);
         }
 
-        // Build the base query
+        // Build the base query - limit to 50 results for performance
         $query = MovieInfo::query()
             ->select(['imdbid', 'title'])
-            ->where('title', 'like', '%'.$this->currentTitle.'%');
+            ->where('title', 'like', '%'.$this->currentTitle.'%')
+            ->limit(50);
 
-        // Add year range filter if we have a year
+        // Add year range filter if we have a year (improves index usage)
         if (! empty($this->currentYear)) {
             $start = Carbon::createFromFormat('Y', $this->currentYear)->subYears(2)->year;
             $end = Carbon::createFromFormat('Y', $this->currentYear)->addYears(2)->year;
