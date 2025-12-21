@@ -26,6 +26,7 @@ class ReleaseBrowseService
 
     /**
      * Used for Browse results.
+     * Optimized query - only fetches fields actually used in views.
      *
      * @return Collection|mixed
      */
@@ -37,56 +38,60 @@ class ReleaseBrowseService
 
         $orderBy = $this->getBrowseOrder($orderBy);
 
+        // Build WHERE conditions once
+        $categorySearch = Category::getCategorySearch($cat);
+        $ageCondition = $maxAge > 0 ? ' AND r.postdate > NOW() - INTERVAL '.$maxAge.' DAY ' : '';
+        $excludeCondition = \count($excludedCats) ? ' AND r.categories_id NOT IN ('.implode(',', $excludedCats).')' : '';
+        $sizeCondition = $minSize > 0 ? sprintf(' AND r.size >= %d', $minSize) : '';
+        $limitClause = ' LIMIT '.$num.($start > 0 ? ' OFFSET '.$start : '');
+        $needsGroupJoin = (int) $groupName !== -1;
+        $groupCondition = $needsGroupJoin ? sprintf(' AND g.name = %s ', escapeString($groupName)) : '';
+
+        // Optimized query: fetch only required fields, minimize JOINs
+        // Uses STRAIGHT_JOIN for categories (small tables), LEFT JOIN for optional data
         $qry = sprintf(
-            "SELECT r.id, r.searchname, r.groups_id, r.guid, r.postdate, r.categories_id, r.size, r.totalpart, r.fromname, r.passwordstatus, r.grabs, r.comments, r.adddate, r.videos_id, r.tv_episodes_id, r.haspreview, r.jpgstatus, r.nfostatus, cp.title AS parent_category, c.title AS sub_category, r.group_name,
-				CONCAT(cp.title, ' > ', c.title) AS category_name,
-				CONCAT(cp.id, ',', c.id) AS category_ids,
-				df.failed AS failed,
-				rn.releases_id AS nfoid,
-				re.releases_id AS reid,
-				v.tvdb, v.trakt, v.tvrage, v.tvmaze, v.imdb, v.tmdb,
-				m.imdbid, m.tmdbid, m.traktid,
-				tve.title, tve.firstaired
-			FROM
-			(
-				SELECT r.id, r.searchname, r.guid, r.postdate, r.groups_id, r.categories_id, r.size, r.totalpart, r.fromname, r.passwordstatus, r.grabs, r.comments, r.adddate, r.videos_id, r.tv_episodes_id, r.haspreview, r.jpgstatus, r.nfostatus, g.name AS group_name, r.movieinfo_id
-				FROM releases r
-				LEFT JOIN usenet_groups g ON g.id = r.groups_id
-				WHERE r.passwordstatus %s
-				%s %s %s %s %s
-				ORDER BY %s %s %s
-			) r
-			LEFT JOIN categories c ON c.id = r.categories_id
-			LEFT JOIN root_categories cp ON cp.id = c.root_categories_id
-			LEFT OUTER JOIN videos v ON r.videos_id = v.id
-			LEFT OUTER JOIN tv_episodes tve ON r.tv_episodes_id = tve.id
-			LEFT OUTER JOIN movieinfo m ON m.id = r.movieinfo_id
-			LEFT OUTER JOIN video_data re ON re.releases_id = r.id
-			LEFT OUTER JOIN release_nfos rn ON rn.releases_id = r.id
-			LEFT OUTER JOIN dnzb_failures df ON df.release_id = r.id
-			GROUP BY r.id
-			ORDER BY %7\$s %8\$s",
+            "SELECT r.id, r.searchname, r.guid, r.postdate, r.categories_id, r.size, r.totalpart,
+                r.fromname, r.grabs, r.comments, r.adddate, r.videos_id, r.haspreview,
+                r.jpgstatus, r.nfostatus,
+                CONCAT(cp.title, ' > ', c.title) AS category_name,
+                %s AS group_name,
+                m.imdbid,
+                (SELECT COUNT(*) FROM dnzb_failures df WHERE df.release_id = r.id) AS failed,
+                EXISTS(SELECT 1 FROM video_data vd WHERE vd.releases_id = r.id) AS reid
+            FROM releases r
+            %s
+            STRAIGHT_JOIN categories c ON c.id = r.categories_id
+            STRAIGHT_JOIN root_categories cp ON cp.id = c.root_categories_id
+            LEFT JOIN movieinfo m ON m.id = r.movieinfo_id
+            WHERE r.passwordstatus %s
+            %s %s %s %s %s
+            ORDER BY r.%s %s
+            %s",
+            $needsGroupJoin ? 'g.name' : '(SELECT name FROM usenet_groups WHERE id = r.groups_id)',
+            $needsGroupJoin ? 'INNER JOIN usenet_groups g ON g.id = r.groups_id' : '',
             $this->showPasswords(),
-            Category::getCategorySearch($cat),
-            ($maxAge > 0 ? (' AND postdate > NOW() - INTERVAL '.$maxAge.' DAY ') : ''),
-            (\count($excludedCats) ? (' AND r.categories_id NOT IN ('.implode(',', $excludedCats).')') : ''),
-            ((int) $groupName !== -1 ? sprintf(' AND g.name = %s ', escapeString($groupName)) : ''),
-            ($minSize > 0 ? sprintf('AND r.size >= %d', $minSize) : ''),
+            $categorySearch,
+            $ageCondition,
+            $excludeCondition,
+            $sizeCondition,
+            $groupCondition,
             $orderBy[0],
             $orderBy[1],
-            ($start === 0 ? ' LIMIT '.$num : ' LIMIT '.$num.' OFFSET '.$start)
+            $limitClause
         );
 
-        $cacheKey = md5($cacheVersion.$qry.$page);
+        $cacheKey = 'browse_'.md5($cacheVersion.$qry);
         $releases = Cache::get($cacheKey);
         if ($releases !== null) {
             return $releases;
         }
+
         $sql = DB::select($qry);
         if (\count($sql) > 0) {
             $possibleRows = $this->getBrowseCount($cat, $maxAge, $excludedCats, $groupName);
             $sql[0]->_totalcount = $sql[0]->_totalrows = $possibleRows;
         }
+
         $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_medium'));
         Cache::put($cacheKey, $sql, $expiresAt);
 
@@ -95,22 +100,25 @@ class ReleaseBrowseService
 
     /**
      * Used for pager on browse page.
+     * Optimized to avoid unnecessary JOINs and use faster counting.
      */
     public function getBrowseCount(array $cat, int $maxAge = -1, array $excludedCats = [], int|string $groupName = ''): int
     {
+        $needsGroupJoin = $groupName !== '' && $groupName !== -1;
+
         return $this->getPagerCount(sprintf(
-            'SELECT COUNT(r.id) AS count
-				FROM releases r
-				%s
-				WHERE r.passwordstatus %s
-				%s
-				%s %s %s ',
-            ($groupName !== -1 ? 'LEFT JOIN usenet_groups g ON g.id = r.groups_id' : ''),
+            'SELECT COUNT(*) AS count
+                FROM releases r
+                %s
+                WHERE r.passwordstatus %s
+                %s
+                %s %s %s',
+            $needsGroupJoin ? 'INNER JOIN usenet_groups g ON g.id = r.groups_id' : '',
             $this->showPasswords(),
-            ($groupName !== -1 ? sprintf(' AND g.name = %s', escapeString($groupName)) : ''),
+            $needsGroupJoin ? sprintf(' AND g.name = %s', escapeString($groupName)) : '',
             Category::getCategorySearch($cat),
-            ($maxAge > 0 ? (' AND r.postdate > NOW() - INTERVAL '.$maxAge.' DAY ') : ''),
-            (\count($excludedCats) ? (' AND r.categories_id NOT IN ('.implode(',', $excludedCats).')') : '')
+            $maxAge > 0 ? ' AND r.postdate > NOW() - INTERVAL '.$maxAge.' DAY ' : '',
+            \count($excludedCats) ? ' AND r.categories_id NOT IN ('.implode(',', $excludedCats).')' : ''
         ));
     }
 
@@ -170,23 +178,24 @@ class ReleaseBrowseService
     }
 
     /**
-     * @return \Illuminate\Cache\|\Illuminate\Database\Eloquent\Collection|mixed
+     * @return \Illuminate\Database\Eloquent\Collection|mixed
      */
     public function getShowsRange($userShows, $offset, $limit, $orderBy, int $maxAge = -1, array $excludedCats = [])
     {
+        $cacheVersion = $this->getCacheVersion();
         $orderBy = $this->getBrowseOrder($orderBy);
         $sql = sprintf(
-            "SELECT r.id, r.searchname, r.guid, r.postdate, r.groups_id, r.categories_id, r.size, r.totalpart, r.fromname, r.passwordstatus, r.grabs, r.comments, r.adddate, r.videos_id, r.tv_episodes_id, r.haspreview, r.jpgstatus,  cp.title AS parent_category, c.title AS sub_category,
-					CONCAT(cp.title, '->', c.title) AS category_name
-				FROM releases r
-				LEFT JOIN categories c ON c.id = r.categories_id
-				LEFT JOIN root_categories cp ON cp.id = c.root_categories_id
-				WHERE %s %s
-				AND r.categories_id BETWEEN %d AND %d
-				AND r.passwordstatus %s
-				%s
-				GROUP BY r.id
-				ORDER BY %s %s %s",
+            "SELECT r.id, r.searchname, r.guid, r.postdate, r.categories_id, r.size, r.totalpart,
+                r.fromname, r.grabs, r.comments, r.adddate, r.videos_id, r.haspreview, r.jpgstatus,
+                CONCAT(cp.title, ' > ', c.title) AS category_name
+            FROM releases r
+            STRAIGHT_JOIN categories c ON c.id = r.categories_id
+            STRAIGHT_JOIN root_categories cp ON cp.id = c.root_categories_id
+            WHERE %s %s
+                AND r.categories_id BETWEEN %d AND %d
+                AND r.passwordstatus %s
+                %s
+            ORDER BY r.%s %s %s",
             $this->uSQL($userShows, 'videos_id'),
             (! empty($excludedCats) ? ' AND r.categories_id NOT IN ('.implode(',', $excludedCats).')' : ''),
             Category::TV_ROOT,
@@ -197,13 +206,14 @@ class ReleaseBrowseService
             $orderBy[1],
             ($offset === false ? '' : (' LIMIT '.$limit.' OFFSET '.$offset))
         );
+        $cacheKey = 'shows_'.md5($cacheVersion.$sql);
         $expiresAt = now()->addMinutes(config('nntmux.cache_expiry_long'));
-        $result = Cache::get(md5($sql));
+        $result = Cache::get($cacheKey);
         if ($result !== null) {
             return $result;
         }
         $result = Release::fromQuery($sql);
-        Cache::put(md5($sql), $result, $expiresAt);
+        Cache::put($cacheKey, $result, $expiresAt);
 
         return $result;
     }
@@ -212,7 +222,7 @@ class ReleaseBrowseService
     {
         return $this->getPagerCount(
             sprintf(
-                'SELECT r.id
+                'SELECT COUNT(*) AS count
 				FROM releases r
 				WHERE %s %s
 				AND r.categories_id BETWEEN %d AND %d
@@ -231,7 +241,7 @@ class ReleaseBrowseService
     /**
      * Creates part of a query for some functions.
      */
-    public function uSQL(Collection|array $userQuery, string $type): string
+    public function uSQL(Collection|array|\Illuminate\Support\Collection $userQuery, string $type): string
     {
         $sql = '(1=2 ';
         foreach ($userQuery as $query) {
@@ -264,145 +274,51 @@ class ReleaseBrowseService
 
     /**
      * Get the count of releases for pager.
+     * Optimized: expects COUNT(*) queries directly for best performance.
      *
-     * @param  string  $query  The query to get the count from.
+     * @param  string  $query  The COUNT query to execute.
      */
     private function getPagerCount(string $query): int
     {
         $maxResults = (int) config('nntmux.max_pager_results');
-        $cacheExpiry = config('nntmux.cache_expiry_short');
+        $cacheExpiry = (int) config('nntmux.cache_expiry_short', 5);
 
-        // Generate cache key from original query
         $cacheKey = 'pager_count_'.md5($query);
 
-        // Check cache first
         $count = Cache::get($cacheKey);
         if ($count !== null) {
             return (int) $count;
         }
 
-        // Check if this is already a COUNT query
-        if (preg_match('/SELECT\s+COUNT\s*\(/is', $query)) {
-            // It's already a COUNT query, just execute it
-            try {
-                $result = DB::select($query);
-                if (isset($result[0])) {
-                    // Handle different possible column names
-                    $count = $result[0]->count ?? $result[0]->total ?? 0;
-                    // Check for COUNT(*) result without alias
-                    if ($count === 0) {
-                        foreach ($result[0] as $value) {
-                            $count = (int) $value;
-                            break;
-                        }
-                    }
-                } else {
-                    $count = 0;
-                }
-
-                // Cap the count at max results if applicable
-                if ($maxResults > 0 && $count > $maxResults) {
-                    $count = $maxResults;
-                }
-
-                // Cache the result
-                Cache::put($cacheKey, $count, now()->addMinutes($cacheExpiry));
-
-                return $count;
-            } catch (\Exception $e) {
-                return 0;
-            }
-        }
-
-        // For regular SELECT queries, optimize for counting
-        $countQuery = $query;
-
-        // Remove ORDER BY clause (not needed for COUNT)
-        $countQuery = preg_replace('/ORDER\s+BY\s+[^)]+$/is', '', $countQuery);
-
-        // Remove GROUP BY if it's only grouping by r.id
-        $countQuery = preg_replace('/GROUP\s+BY\s+r\.id\s*$/is', '', $countQuery);
-
-        // Check if query has DISTINCT in SELECT
-        $hasDistinct = preg_match('/SELECT\s+DISTINCT/is', $countQuery);
-
-        // Replace SELECT clause with COUNT
-        if ($hasDistinct || preg_match('/GROUP\s+BY/is', $countQuery)) {
-            // For queries with DISTINCT or GROUP BY, count distinct r.id
-            $countQuery = preg_replace(
-                '/SELECT\s+.+?\s+FROM/is',
-                'SELECT COUNT(DISTINCT r.id) as count FROM',
-                $countQuery
-            );
-        } else {
-            // For simple queries, use COUNT(*)
-            $countQuery = preg_replace(
-                '/SELECT\s+.+?\s+FROM/is',
-                'SELECT COUNT(*) as count FROM',
-                $countQuery
-            );
-        }
-
-        // Remove LIMIT/OFFSET from the count query
-        $countQuery = preg_replace('/LIMIT\s+\d+(\s+OFFSET\s+\d+)?$/is', '', $countQuery);
-
         try {
-            // If max results is set and query might return too many results
-            if ($maxResults > 0) {
-                // First check if count would exceed max
-                $testQuery = sprintf('SELECT 1 FROM (%s) as test LIMIT %d',
-                    preg_replace('/SELECT\s+COUNT.+?\s+FROM/is', 'SELECT 1 FROM', $countQuery),
-                    $maxResults + 1
-                );
+            $result = DB::select($query);
+            $count = 0;
 
-                $testResult = DB::select($testQuery);
-                if (count($testResult) > $maxResults) {
-                    Cache::put($cacheKey, $maxResults, now()->addMinutes($cacheExpiry));
-
-                    return $maxResults;
+            if (isset($result[0])) {
+                // Handle the count result
+                $count = $result[0]->count ?? 0;
+                if ($count === 0) {
+                    // Fallback: get first property value
+                    foreach ($result[0] as $value) {
+                        $count = (int) $value;
+                        break;
+                    }
                 }
             }
 
-            // Execute the count query
-            $result = DB::select($countQuery);
-            $count = isset($result[0]) ? (int) $result[0]->count : 0;
+            // Cap at max results if configured
+            if ($maxResults > 0 && $count > $maxResults) {
+                $count = $maxResults;
+            }
 
-            // Cache the result
             Cache::put($cacheKey, $count, now()->addMinutes($cacheExpiry));
 
-            return $count;
+            return (int) $count;
         } catch (\Exception $e) {
-            // If optimization fails, try a simpler approach
-            try {
-                // Extract the core table and WHERE conditions
-                if (preg_match('/FROM\s+releases\s+r\s+(.+?)(?:ORDER\s+BY|LIMIT|$)/is', $query, $matches)) {
-                    $conditions = $matches[1];
-                    // Remove JOINs but keep WHERE
-                    $conditions = preg_replace('/(?:LEFT\s+|INNER\s+)?(?:OUTER\s+)?JOIN\s+.+?(?=WHERE|LEFT|INNER|JOIN|$)/is', '', $conditions);
-
-                    $fallbackQuery = sprintf('SELECT COUNT(*) as count FROM releases r %s', trim($conditions));
-
-                    if ($maxResults > 0) {
-                        $fallbackQuery = sprintf('SELECT COUNT(*) as count FROM (SELECT 1 FROM releases r %s LIMIT %d) as limited',
-                            trim($conditions),
-                            $maxResults
-                        );
-                    }
-
-                    $result = DB::select($fallbackQuery);
-                    $count = isset($result[0]) ? (int) $result[0]->count : 0;
-
-                    Cache::put($cacheKey, $count, now()->addMinutes($cacheExpiry));
-
-                    return $count;
-                }
-            } catch (\Exception $fallbackException) {
-                // Log the error for debugging
-                \Illuminate\Support\Facades\Log::error('getPagerCount failed', [
-                    'query' => $query,
-                    'error' => $fallbackException->getMessage(),
-                ]);
-            }
+            \Illuminate\Support\Facades\Log::error('getPagerCount failed', [
+                'query' => $query,
+                'error' => $e->getMessage(),
+            ]);
 
             return 0;
         }
