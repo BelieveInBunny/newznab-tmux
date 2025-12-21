@@ -111,6 +111,14 @@ final class BinaryHandler
         int $fileNumber,
         int $partSize
     ): int {
+        // Verify collection exists before inserting to avoid FK constraint violation
+        $collectionExists = DB::selectOne('SELECT 1 FROM collections WHERE id = ? LIMIT 1', [$collectionId]);
+        if ($collectionExists === null) {
+            Log::warning('BinaryHandler: Collection ID '.$collectionId.' does not exist, skipping binary insert');
+
+            return 0;
+        }
+
         DB::statement(
             'INSERT OR IGNORE INTO binaries (binaryhash, name, collections_id, totalparts, currentparts, filenumber, partsize) VALUES (?, ?, ?, ?, 1, ?, ?)',
             [$hash, $name, $collectionId, $totalParts, $fileNumber, $partSize]
@@ -139,6 +147,14 @@ final class BinaryHandler
         int $fileNumber,
         int $partSize
     ): int {
+        // Verify collection exists before inserting to avoid FK constraint violation
+        $collectionExists = DB::selectOne('SELECT 1 FROM collections WHERE id = ? LIMIT 1', [$collectionId]);
+        if ($collectionExists === null) {
+            Log::warning('BinaryHandler: Collection ID '.$collectionId.' does not exist, skipping binary insert');
+
+            return 0;
+        }
+
         $sql = 'INSERT INTO binaries '
             .'(binaryhash, name, collections_id, totalparts, currentparts, filenumber, partsize) '
             .'VALUES (UNHEX(?), ?, ?, ?, 1, ?, ?) '
