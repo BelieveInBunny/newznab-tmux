@@ -114,7 +114,9 @@ if (! function_exists('makeFieldLinks')) {
      */
     function makeFieldLinks($data, $field, $type)
     {
-        $tmpArr = explode(', ', $data[$field]);
+        // Support both array and object access
+        $fieldValue = is_array($data) ? ($data[$field] ?? '') : ($data->$field ?? '');
+        $tmpArr = explode(', ', $fieldValue);
         $newArr = [];
         $i = 0;
         foreach ($tmpArr as $ta) {
