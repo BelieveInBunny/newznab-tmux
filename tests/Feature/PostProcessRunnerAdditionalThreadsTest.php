@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
-use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
+use App\Services\Runners\PostProcessRunner;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -12,9 +12,11 @@ use Illuminate\Support\Facades\Schema;
 use PDO;
 use Tests\TestCase;
 
-class AdditionalCandidateQueryTest extends TestCase
+class PostProcessRunnerAdditionalThreadsTest extends TestCase
 {
     private string $databasePath;
+
+    private string $tmpUnrarPath;
 
     /**
      * @var array<string, string|false>
@@ -23,7 +25,8 @@ class AdditionalCandidateQueryTest extends TestCase
 
     public function createApplication()
     {
-        $this->databasePath = sys_get_temp_dir().'/nntmux-additional-candidate-query-test.sqlite';
+        $this->databasePath = sys_get_temp_dir().'/nntmux-postprocess-additional-threads.sqlite';
+        $this->tmpUnrarPath = sys_get_temp_dir().'/nntmux-additional-threads-'.uniqid('', true);
 
         $this->originalEnvironment = [
             'APP_ENV' => getenv('APP_ENV'),
@@ -37,7 +40,7 @@ class AdditionalCandidateQueryTest extends TestCase
 
         $pdo = new PDO('sqlite:'.$this->databasePath);
         $pdo->exec('CREATE TABLE settings (name VARCHAR PRIMARY KEY, value TEXT NULL)');
-        $pdo->exec("INSERT INTO settings (name, value) VALUES ('categorizeforeign', '0'), ('catwebdl', '0')");
+        $pdo->exec("INSERT INTO settings (name, value) VALUES ('categorizeforeign', '0'), ('catwebdl', '0'), ('postthreads', '5'), ('releaseprocessingtimeout', '120')");
 
         $this->setEnvironmentValue('APP_ENV', 'testing');
         $this->setEnvironmentValue('DB_CONNECTION', 'sqlite');
@@ -56,6 +59,8 @@ class AdditionalCandidateQueryTest extends TestCase
         config([
             'database.default' => 'sqlite',
             'database.connections.sqlite.database' => $this->databasePath,
+            'nntmux.echocli' => false,
+            'nntmux.tmp_unrar_path' => $this->tmpUnrarPath,
         ]);
 
         DB::purge();
@@ -69,6 +74,9 @@ class AdditionalCandidateQueryTest extends TestCase
         if ($this->databasePath !== '' && file_exists($this->databasePath)) {
             unlink($this->databasePath);
         }
+        if ($this->tmpUnrarPath !== '' && is_dir($this->tmpUnrarPath)) {
+            app('files')->deleteDirectory($this->tmpUnrarPath);
+        }
 
         parent::tearDown();
 
@@ -77,96 +85,75 @@ class AdditionalCandidateQueryTest extends TestCase
         }
     }
 
-    public function test_bucket_chars_preserve_alphabetic_guid_buckets(): void
+    public function test_process_additional_uses_configured_postthreads_for_streaming_process_pool(): void
     {
-        DB::table('categories')->insert([
-            ['id' => 1, 'disablepreview' => 0],
-            ['id' => 2, 'disablepreview' => 1],
-        ]);
+        DB::table('categories')->insert(['id' => 1, 'disablepreview' => 0]);
+        foreach (['0', '1', '2', '3', '4'] as $index => $leftguid) {
+            DB::table('releases')->insert($this->releaseRow($index + 1, $leftguid));
+        }
 
-        DB::table('releases')->insert([
-            $this->releaseRow(1, '0'),
-            $this->releaseRow(2, '9'),
-            $this->releaseRow(3, 'a'),
-            $this->releaseRow(4, 'a'),
-            $this->releaseRow(5, 'f'),
-            $this->releaseRow(6, 'b', categoriesId: 2),
-        ]);
+        $runner = new class extends PostProcessRunner
+        {
+            public int $capturedMaxProcesses = 0;
 
-        $chars = AdditionalCandidateQuery::bucketChars();
-        sort($chars);
+            /**
+             * @var array<string|int, string>
+             */
+            public array $capturedCommands = [];
 
-        $this->assertSame(['0', '9', 'a', 'f'], $chars);
+            protected function runStreamingCommands(array $commands, int $maxProcesses, string $desc): void
+            {
+                $this->capturedCommands = $commands;
+                $this->capturedMaxProcesses = $maxProcesses;
+            }
+        };
+
+        $runner->processAdditional();
+
+        $this->assertSame(5, $runner->capturedMaxProcesses);
+        $this->assertCount(5, $runner->capturedCommands);
+        $this->assertContains(PHP_BINARY.' artisan postprocess:guid additional 0', $runner->capturedCommands);
+        $this->assertContains(PHP_BINARY.' artisan postprocess:guid additional 4', $runner->capturedCommands);
     }
 
-    public function test_bucket_chars_skip_active_claims_but_include_stale_claims(): void
+    public function test_process_additional_repeats_hot_bucket_to_fill_configured_threads(): void
     {
-        DB::table('categories')->insert([
-            ['id' => 1, 'disablepreview' => 0],
-        ]);
+        DB::table('categories')->insert(['id' => 1, 'disablepreview' => 0]);
+        foreach (range(1, 5) as $id) {
+            DB::table('releases')->insert($this->releaseRow($id, 'a'));
+        }
 
-        DB::table('releases')->insert([
-            $this->releaseRow(1, 'a', claimedAt: now()),
-            $this->releaseRow(2, 'b', claimedAt: now()->subSeconds(301)),
-            $this->releaseRow(3, 'c'),
-        ]);
+        $runner = new class extends PostProcessRunner
+        {
+            public int $capturedMaxProcesses = 0;
 
-        $chars = AdditionalCandidateQuery::bucketChars();
-        sort($chars);
+            /**
+             * @var array<string|int, string>
+             */
+            public array $capturedCommands = [];
 
-        $this->assertSame(['b', 'c'], $chars);
-    }
+            protected function runStreamingCommands(array $commands, int $maxProcesses, string $desc): void
+            {
+                $this->capturedCommands = $commands;
+                $this->capturedMaxProcesses = $maxProcesses;
+            }
+        };
 
-    public function test_monitor_builder_can_include_claimed_releases_while_available_builder_excludes_them(): void
-    {
-        DB::table('categories')->insert([
-            ['id' => 1, 'disablepreview' => 0],
-        ]);
+        $runner->processAdditional();
 
-        DB::table('releases')->insert([
-            $this->releaseRow(1, 'a', claimedAt: now()),
-            $this->releaseRow(2, 'b'),
-        ]);
-
-        $this->assertSame(1, AdditionalCandidateQuery::baseBuilder()->count());
-        $this->assertSame(2, AdditionalCandidateQuery::baseBuilder(includeClaimed: true)->count());
-    }
-
-    public function test_claim_batch_excludes_active_claims_and_recovers_stale_claims(): void
-    {
-        DB::table('categories')->insert([
-            ['id' => 1, 'disablepreview' => 0],
-        ]);
-
-        DB::table('releases')->insert([
-            $this->releaseRow(1, 'a', postdate: '2026-07-12 10:00:00'),
-            $this->releaseRow(2, 'a', postdate: '2026-07-12 09:00:00'),
-        ]);
-
-        $first = AdditionalCandidateQuery::claimBatch('a', 1, 'token-one', columns: ['id']);
-        $this->assertSame([1], $first->pluck('id')->all());
-
-        $second = AdditionalCandidateQuery::claimBatch('a', 10, 'token-two', columns: ['id']);
-        $this->assertSame([2], $second->pluck('id')->all());
-
-        DB::table('releases')
-            ->where('id', 1)
-            ->update(['additional_pp_claimed_at' => now()->subSeconds(301)]);
-
-        $third = AdditionalCandidateQuery::claimBatch('a', 10, 'token-three', columns: ['id']);
-        $this->assertSame([1], $third->pluck('id')->all());
+        $this->assertSame(5, $runner->capturedMaxProcesses);
+        $this->assertCount(5, $runner->capturedCommands);
+        $this->assertSame(
+            array_fill(0, 5, PHP_BINARY.' artisan postprocess:guid additional a'),
+            array_values($runner->capturedCommands)
+        );
     }
 
     /**
      * @return array<string, mixed>
      */
-    private function releaseRow(
-        int $id,
-        string $leftguid,
-        int $categoriesId = 1,
-        ?\DateTimeInterface $claimedAt = null,
-        string $postdate = '2026-07-12 00:00:00'
-    ): array {
+    private function releaseRow(int $id, string $leftguid): array
+    {
         return [
             'id' => $id,
             'guid' => $leftguid.'-guid-'.$id,
@@ -174,11 +161,11 @@ class AdditionalCandidateQueryTest extends TestCase
             'passwordstatus' => -1,
             'haspreview' => -1,
             'nzbstatus' => 1,
-            'categories_id' => $categoriesId,
+            'categories_id' => 1,
             'size' => 2 * 1048576,
-            'postdate' => $postdate,
-            'additional_pp_claimed_at' => $claimedAt?->format('Y-m-d H:i:s'),
-            'additional_pp_claim_token' => $claimedAt === null ? null : 'claimed',
+            'postdate' => '2026-07-12 10:00:00',
+            'additional_pp_claimed_at' => null,
+            'additional_pp_claim_token' => null,
         ];
     }
 
@@ -208,6 +195,7 @@ class AdditionalCandidateQueryTest extends TestCase
         DB::table('settings')->upsert([
             ['name' => 'categorizeforeign', 'value' => '0'],
             ['name' => 'catwebdl', 'value' => '0'],
+            ['name' => 'postthreads', 'value' => '5'],
             ['name' => 'releaseprocessingtimeout', 'value' => '120'],
         ], ['name'], ['value']);
 
