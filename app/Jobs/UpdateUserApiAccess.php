@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Jobs;
 
-use App\Models\UserRequest;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -18,7 +17,7 @@ use Throwable;
 
 #[Backoff([1, 5, 30])]
 #[FailOnTimeout]
-final class RecordApiUsage implements ShouldQueue
+final class UpdateUserApiAccess implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
@@ -28,7 +27,6 @@ final class RecordApiUsage implements ShouldQueue
 
     public function __construct(
         public readonly int $userId,
-        public readonly string $requestUri,
         public readonly ?string $ip,
         public readonly string $occurredAt,
     ) {
@@ -37,17 +35,15 @@ final class RecordApiUsage implements ShouldQueue
 
     public function handle(): void
     {
-        // Legacy job retained while pre-deployment audit jobs drain.
-        UserRequest::recordApiRequest($this->userId, $this->requestUri, $this->occurredAt);
-
         $lockKey = 'api_access_update:'.$this->userId;
         $interval = max(1, (int) config('nntmux.api.access_update_interval', 60));
+
         try {
             if (! Cache::add($lockKey, true, $interval)) {
                 return;
             }
         } catch (Throwable) {
-            // Cache degradation must not retry and duplicate the durable audit row.
+            // Cache degradation must not prevent the metadata update.
         }
 
         $update = ['apiaccess' => $this->occurredAt];
